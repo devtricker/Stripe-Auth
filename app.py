@@ -66,13 +66,6 @@ def check_card():
 
     session = requests.Session()
     session.cookies.update(COOKIES)
-    
-    # 🚫 DISABLE PROXY (Fix 407 error)
-    session.trust_env = False  # Ignore system proxy settings
-    session.proxies = {
-        'http': None,
-        'https': None
-    }
 
     # ==========================================
     # STEP 1: Get Nonce
